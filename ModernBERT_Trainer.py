@@ -14,6 +14,8 @@ import numpy as np
 from typing import List, Tuple, Dict, Any
 from seqeval.metrics import classification_report
 
+from modeling_modernbert_crf import ModernBertForTokenClassificationCRF
+
 from transformers import (
     AutoTokenizer,
     TrainingArguments,
@@ -208,64 +210,6 @@ tokenized_datasets = dataset.map(
     remove_columns=dataset["train"].column_names,
     desc="Tokenizing"
 )
-
-class ModernBertForTokenClassificationCRF(nn.Module):
-    def __init__(self, model_name: str, num_labels: int, config: AutoConfig = None):
-        super().__init__()
-        if config is None:
-            config = AutoConfig.from_pretrained(model_name, num_labels=num_labels)
-        self.num_labels = num_labels
-        self.bert = AutoModel.from_pretrained(model_name, config=config)
-        dropout_rate = getattr(config, "hidden_dropout_prob", getattr(config, "embedding_dropout", 0.1))
-        self.dropout = nn.Dropout(dropout_rate)
-        self.classifier = nn.Linear(config.hidden_size, num_labels)
-        self.crf = CRF(num_labels, batch_first=True)
-        assert self.crf.transitions.shape == (num_labels, num_labels)
-
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> Dict[str, Any]:
-        if "num_items_in_batch" in kwargs:
-            kwargs.pop("num_items_in_batch")
-
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        sequence_output = self.dropout(outputs.last_hidden_state)
-        emissions = self.classifier(sequence_output)
-
-        mask = (labels != -100) if labels is not None else attention_mask.bool()
-        mask[:, 0] = True  # Ensure the first token is always valid (CRF requirement)
-
-        batch_size = emissions.size(0)
-        seq_length = emissions.size(1)
-
-        if labels is not None:
-            active_labels = labels.clone()
-            active_labels[~mask] = 0
-
-            loss_sum = -self.crf(emissions, active_labels, mask=mask, reduction='sum')
-            num_valid_tokens = mask.sum()
-            loss = loss_sum / num_valid_tokens.float() if num_valid_tokens > 0 else loss_sum
-
-            pred_tags = self.crf.decode(emissions, mask=mask)
-            pred_tensor = torch.full((batch_size, seq_length), -100, device=emissions.device)
-            for i, pred_seq in enumerate(pred_tags):
-                length = len(pred_seq)
-                pred_tensor[i, :length] = torch.tensor(pred_seq, device=emissions.device)
-
-            return {
-                "loss": loss,
-                "logits": emissions,  
-                "predictions": pred_tensor
-            }
-        else:
-            pred_tags = self.crf.decode(emissions, mask=mask)
-            pred_tensor = torch.full((batch_size, seq_length), -100, device=emissions.device)
-            for i, pred_seq in enumerate(pred_tags):
-                length = len(pred_seq)
-                pred_tensor[i, :length] = torch.tensor(pred_seq, device=emissions.device)
-
-            return {
-                "logits": emissions,
-                "predictions": pred_tensor
-            }
 
 use_flash_attention = True if DEVICE.type == "cuda" else False
 try:
